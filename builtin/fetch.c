@@ -1068,7 +1068,7 @@ N_("It took %.2f seconds to check forced updates. You can use\n"
    " to avoid this check.\n");
 
 static int store_updated_refs(const char *raw_url, const char *remote_name,
-			      int connectivity_checked, struct ref *ref_map)
+			      struct ref *ref_map)
 {
 	struct fetch_head fetch_head;
 	struct commit *commit;
@@ -1089,16 +1089,6 @@ static int store_updated_refs(const char *raw_url, const char *remote_name,
 		url = transport_anonymize_url(raw_url);
 	else
 		url = xstrdup("foreign");
-
-	if (!connectivity_checked) {
-		struct check_connected_options opt = CHECK_CONNECTED_INIT;
-
-		rm = ref_map;
-		if (check_connected(iterate_ref_map, &rm, &opt)) {
-			rc = error(_("%s did not send all necessary objects\n"), url);
-			goto abort;
-		}
-	}
 
 	if (atomic_fetch) {
 		transaction = ref_transaction_begin(&err);
@@ -1303,6 +1293,18 @@ static int fetch_refs(struct transport *transport, struct ref *ref_map)
 	}
 
 	/*
+	 * If the transport didn't yet check for us, we need to verify
+	 * ourselves that we have obtained all missing objects now.
+	 */
+	if (!transport->smart_options || !transport->smart_options->connectivity_checked) {
+		if (check_connected(iterate_ref_map, &ref_map, NULL)) {
+			ret = error(_("remote did not send all necessary objects\n"));
+			transport_unlock_pack(transport);
+			return ret;
+		}
+	}
+
+	/*
 	 * Keep the new pack's ".keep" file around to allow the caller
 	 * time to update refs to reference the new objects.
 	 */
@@ -1312,13 +1314,10 @@ static int fetch_refs(struct transport *transport, struct ref *ref_map)
 /* Update local refs based on the ref values fetched from a remote */
 static int consume_refs(struct transport *transport, struct ref *ref_map)
 {
-	int connectivity_checked = transport->smart_options
-		? transport->smart_options->connectivity_checked : 0;
 	int ret;
 	trace2_region_enter("fetch", "consume_refs", the_repository);
 	ret = store_updated_refs(transport->url,
 				 transport->remote->name,
-				 connectivity_checked,
 				 ref_map);
 	transport_unlock_pack(transport);
 	trace2_region_leave("fetch", "consume_refs", the_repository);
