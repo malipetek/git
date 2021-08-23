@@ -846,13 +846,11 @@ static int update_local_ref(struct ref *ref,
 			    int summary_width)
 {
 	struct commit *current = NULL, *updated;
-	enum object_type type;
 	struct branch *current_branch = branch_get(NULL);
 	const char *pretty_ref = prettify_refname(ref->name);
 	int fast_forward = 0;
 
-	type = oid_object_info(the_repository, &ref->new_oid, NULL);
-	if (type < 0)
+	if (!repo_has_object_file(the_repository, &ref->new_oid))
 		die(_("object %s not found"), oid_to_hex(&ref->new_oid));
 
 	if (oideq(&ref->old_oid, &ref->new_oid)) {
@@ -964,7 +962,7 @@ static int update_local_ref(struct ref *ref,
 	}
 }
 
-static int iterate_ref_map(void *cb_data, struct object_id *oid)
+static struct object_id *iterate_ref_map(void *cb_data)
 {
 	struct ref **rm = cb_data;
 	struct ref *ref = *rm;
@@ -972,10 +970,9 @@ static int iterate_ref_map(void *cb_data, struct object_id *oid)
 	while (ref && ref->status == REF_STATUS_REJECT_SHALLOW)
 		ref = ref->next;
 	if (!ref)
-		return -1; /* end of the list */
+		return NULL;
 	*rm = ref->next;
-	oidcpy(oid, &ref->old_oid);
-	return 0;
+	return &ref->old_oid;
 }
 
 struct fetch_head {
@@ -1071,7 +1068,7 @@ N_("It took %.2f seconds to check forced updates. You can use\n"
    " to avoid this check.\n");
 
 static int store_updated_refs(const char *raw_url, const char *remote_name,
-			      int connectivity_checked, struct ref *ref_map)
+			      struct ref *ref_map)
 {
 	struct fetch_head fetch_head;
 	struct commit *commit;
@@ -1092,16 +1089,6 @@ static int store_updated_refs(const char *raw_url, const char *remote_name,
 		url = transport_anonymize_url(raw_url);
 	else
 		url = xstrdup("foreign");
-
-	if (!connectivity_checked) {
-		struct check_connected_options opt = CHECK_CONNECTED_INIT;
-
-		rm = ref_map;
-		if (check_connected(iterate_ref_map, &rm, &opt)) {
-			rc = error(_("%s did not send all necessary objects\n"), url);
-			goto abort;
-		}
-	}
 
 	if (atomic_fetch) {
 		transaction = ref_transaction_begin(&err);
@@ -1131,11 +1118,14 @@ static int store_updated_refs(const char *raw_url, const char *remote_name,
 				continue;
 			}
 
-			commit = lookup_commit_reference_gently(the_repository,
-								&rm->old_oid,
-								1);
-			if (!commit)
-				rm->fetch_head_status = FETCH_HEAD_NOT_FOR_MERGE;
+			commit = lookup_commit_in_graph(the_repository, &rm->old_oid);
+			if (!commit) {
+				commit = lookup_commit_reference_gently(the_repository,
+									&rm->old_oid,
+									1);
+				if (!commit)
+					rm->fetch_head_status = FETCH_HEAD_NOT_FOR_MERGE;
+			}
 
 			if (rm->fetch_head_status != want_status)
 				continue;
@@ -1284,32 +1274,50 @@ static int check_exist_and_connected(struct ref *ref_map)
 
 static int fetch_refs(struct transport *transport, struct ref *ref_map)
 {
-	int ret = check_exist_and_connected(ref_map);
-	if (ret) {
-		trace2_region_enter("fetch", "fetch_refs", the_repository);
-		ret = transport_fetch_refs(transport, ref_map);
-		trace2_region_leave("fetch", "fetch_refs", the_repository);
-	}
+	int ret;
+
+	/*
+	 * We don't need to perform a fetch in case we can already satisfy all
+	 * refs.
+	 */
+	ret = check_exist_and_connected(ref_map);
 	if (!ret)
-		/*
-		 * Keep the new pack's ".keep" file around to allow the caller
-		 * time to update refs to reference the new objects.
-		 */
 		return 0;
-	transport_unlock_pack(transport);
-	return ret;
+
+	trace2_region_enter("fetch", "fetch_refs", the_repository);
+	ret = transport_fetch_refs(transport, ref_map);
+	trace2_region_leave("fetch", "fetch_refs", the_repository);
+	if (ret) {
+		transport_unlock_pack(transport);
+		return ret;
+	}
+
+	/*
+	 * If the transport didn't yet check for us, we need to verify
+	 * ourselves that we have obtained all missing objects now.
+	 */
+	if (!transport->smart_options || !transport->smart_options->connectivity_checked) {
+		if (check_connected(iterate_ref_map, &ref_map, NULL)) {
+			ret = error(_("remote did not send all necessary objects\n"));
+			transport_unlock_pack(transport);
+			return ret;
+		}
+	}
+
+	/*
+	 * Keep the new pack's ".keep" file around to allow the caller
+	 * time to update refs to reference the new objects.
+	 */
+	return 0;
 }
 
 /* Update local refs based on the ref values fetched from a remote */
 static int consume_refs(struct transport *transport, struct ref *ref_map)
 {
-	int connectivity_checked = transport->smart_options
-		? transport->smart_options->connectivity_checked : 0;
 	int ret;
 	trace2_region_enter("fetch", "consume_refs", the_repository);
 	ret = store_updated_refs(transport->url,
 				 transport->remote->name,
-				 connectivity_checked,
 				 ref_map);
 	transport_unlock_pack(transport);
 	trace2_region_leave("fetch", "consume_refs", the_repository);
